@@ -1,6 +1,99 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { getDb } from '../src/db.js';
-import { ImapProvider } from '../src/providers/imap.js';
+import { ImapProvider, selectBodyParts, decodeBody, generateUniqueUsername } from '../src/providers/imap.js';
+import { randomUsername } from '../src/username-generator.js';
+import type { InboxData } from '../src/providers/base.js';
+
+const imapMockState = vi.hoisted(() => ({
+  connectCount: 0,
+  searchResult: [] as number[],
+  fetchRanges: [] as number[][],
+  // getMessage fixtures
+  bodyStructure: undefined as unknown,
+  partContents: {} as Record<string, { content: Buffer; charset?: string }>,
+  downloadCalls: [] as string[],
+}));
+
+vi.mock('imapflow', () => {
+  class FakeImapFlow {
+    async connect(): Promise<void> {
+      imapMockState.connectCount++;
+    }
+    once(): void {}
+    async logout(): Promise<void> {}
+    async getMailboxLock(): Promise<{ release(): void }> {
+      return { release() {} };
+    }
+    async search(): Promise<number[]> {
+      return [...imapMockState.searchResult];
+    }
+    async *fetch(range: number[]): AsyncGenerator<{ uid: number; envelope: { from: { address: string }[]; subject: string; date: Date } }> {
+      imapMockState.fetchRanges.push(range);
+      for (const uid of range) {
+        yield { uid, envelope: { from: [{ address: 'sender@example.test' }], subject: `mail-${uid}`, date: new Date() } };
+      }
+    }
+    async fetchOne(_id: string, query: Record<string, unknown>): Promise<unknown> {
+      // Requesting fixed body parts is the defect this suite locks out: a part
+      // that does not exist fails the entire FETCH, not just that part.
+      if (query?.bodyParts) throw new Error('Command failed');
+      if (imapMockState.bodyStructure === undefined) return undefined;
+      return {
+        uid: 1,
+        envelope: { from: [{ address: 'sender@example.test' }], subject: 'probe', date: new Date('2026-07-26T21:03:47.000Z') },
+        bodyStructure: imapMockState.bodyStructure,
+      };
+    }
+    async download(_range: string, part: string): Promise<{ meta: { charset?: string }; content: AsyncIterable<Buffer> }> {
+      imapMockState.downloadCalls.push(part);
+      const found = imapMockState.partContents[part];
+      if (!found) throw new Error('Command failed');
+      return {
+        meta: { charset: found.charset },
+        content: (async function* () { yield found.content; })(),
+      };
+    }
+    async mailboxOpen(): Promise<void> {}
+  }
+  return { ImapFlow: FakeImapFlow };
+});
+
+function imapInbox(accountId: string, address: string): InboxData {
+  return { address, authData: { imapAccountId: accountId, username: 'x', domain: 'example.com' }, provider: 'imap', apiBase: '' };
+}
+
+describe('ImapProvider polling', () => {
+  it('fetches only the newest messages in one batched fetch call', async () => {
+    getDb().prepare(
+      `INSERT INTO imap_accounts (id, host, port, user, password, domain) VALUES ('pool-limit', 'imap.test.com', 993, 'u', 'p', 'example.com')`,
+    ).run();
+    imapMockState.searchResult = Array.from({ length: 30 }, (_, i) => i + 1);
+    imapMockState.fetchRanges = [];
+
+    const p = new ImapProvider();
+    const messages = await p.getMessages(imapInbox('pool-limit', 'x@example.com'));
+
+    expect(messages).toHaveLength(20);
+    expect(messages[0].id).toBe('11');
+    expect(messages[19].id).toBe('30');
+    expect(imapMockState.fetchRanges).toHaveLength(1);
+    expect(imapMockState.fetchRanges[0]).toHaveLength(20);
+  });
+
+  it('shares one connection across concurrent polls of the same account', async () => {
+    getDb().prepare(
+      `INSERT INTO imap_accounts (id, host, port, user, password, domain) VALUES ('pool-share', 'imap.test.com', 993, 'u', 'p', 'example.com')`,
+    ).run();
+    imapMockState.searchResult = [1];
+    const before = imapMockState.connectCount;
+
+    const p = new ImapProvider();
+    const inbox = imapInbox('pool-share', 'y@example.com');
+    await Promise.all([p.getMessages(inbox), p.getMessages(inbox)]);
+
+    expect(imapMockState.connectCount - before).toBe(1);
+  });
+});
 
 describe('ImapProvider', () => {
   it('has correct meta', () => {
@@ -38,7 +131,10 @@ describe('ImapProvider', () => {
 
     const p = new ImapProvider();
     const inbox = await p.createInbox({ domain: 'example.com' });
-    expect(inbox.address).toMatch(/^[a-z0-9]+@example\.com$/);
+    // Contract changed on purpose: generated usernames are now human-shaped
+    // (mark.reyes52 / d_watson91 / juliahoffman), so the old flat [a-z0-9]+
+    // pattern no longer describes a correct address.
+    expect(inbox.address).toMatch(/^[a-z]+([._][a-z]+)?[0-9]{0,2}@example\.com$/);
     expect(inbox.provider).toBe('imap');
     expect(inbox.authData.imapAccountId).toBe('t1');
     expect(inbox.authData.domain).toBe('example.com');
@@ -75,5 +171,211 @@ describe('ImapProvider', () => {
     const domains = await p.getDomains();
     const exampleCount = domains.filter(d => d === 'example.com').length;
     expect(exampleCount).toBe(1);
+  });
+});
+
+// Structures observed on real mail through Cloudflare Email Routing -> Gmail.
+// The previous implementation hardcoded bodyParts ['1','2'], which 502'd on
+// single-part mail and, under multipart/mixed, returned raw MIME as the text
+// and an attachment's payload as the html.
+const STRUCTURE_CASES = [
+  {
+    name: 'single-part text/plain reads part 1 and never asks for a part that does not exist',
+    structure: { type: 'text/plain', parameters: { charset: 'utf-8' } },
+    parts: { '1': { content: Buffer.from('Your verification code is 483920\r\n'), charset: 'utf-8' } },
+    expectText: 'Your verification code is 483920\r\n',
+    expectHtml: undefined,
+    expectDownloads: ['1'],
+  },
+  {
+    name: 'single-part text/html maps the whole body to html',
+    structure: { type: 'text/html', parameters: { charset: 'utf-8' } },
+    parts: { '1': { content: Buffer.from('<p>code 111222</p>'), charset: 'utf-8' } },
+    expectText: undefined,
+    expectHtml: '<p>code 111222</p>',
+    expectDownloads: ['1'],
+  },
+  {
+    name: 'multipart/alternative reads text from 1 and html from 2',
+    structure: {
+      type: 'multipart/alternative',
+      childNodes: [
+        { part: '1', type: 'text/plain', parameters: { charset: 'utf-8' } },
+        { part: '2', type: 'text/html', parameters: { charset: 'utf-8' } },
+      ],
+    },
+    parts: {
+      '1': { content: Buffer.from('code 751634'), charset: 'utf-8' },
+      '2': { content: Buffer.from('<b>code 751634</b>'), charset: 'utf-8' },
+    },
+    expectText: 'code 751634',
+    expectHtml: '<b>code 751634</b>',
+    expectDownloads: ['1', '2'],
+  },
+  {
+    name: 'multipart/mixed reads the nested 1.1/1.2 and skips the attachment at 2',
+    structure: {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          part: '1',
+          type: 'multipart/alternative',
+          childNodes: [
+            { part: '1.1', type: 'text/plain', parameters: { charset: 'utf-8' } },
+            { part: '1.2', type: 'text/html', parameters: { charset: 'utf-8' } },
+          ],
+        },
+        { part: '2', type: 'text/plain', disposition: 'attachment' },
+      ],
+    },
+    parts: {
+      '1.1': { content: Buffer.from('code 206518'), charset: 'utf-8' },
+      '1.2': { content: Buffer.from('<b>code 206518</b>'), charset: 'utf-8' },
+      '2': { content: Buffer.from('attachment payload'), charset: 'utf-8' },
+    },
+    expectText: 'code 206518',
+    expectHtml: '<b>code 206518</b>',
+    expectDownloads: ['1.1', '1.2'],
+  },
+];
+
+describe('ImapProvider.getMessage body extraction', () => {
+  it.each(STRUCTURE_CASES)('$name', async (c) => {
+    const accountId = `struct-${STRUCTURE_CASES.indexOf(c)}`;
+    getDb().prepare(
+      `INSERT INTO imap_accounts (id, host, port, user, password, domain) VALUES (?, 'imap.test.com', 993, 'u', 'p', 'example.com')`,
+    ).run(accountId);
+    imapMockState.bodyStructure = c.structure;
+    imapMockState.partContents = c.parts;
+    imapMockState.downloadCalls = [];
+
+    const p = new ImapProvider();
+    const msg = await p.getMessage(imapInbox(accountId, 'x@example.com'), '42');
+
+    expect(msg.text).toBe(c.expectText);
+    expect(msg.html).toBe(c.expectHtml);
+    expect(imapMockState.downloadCalls).toEqual(c.expectDownloads);
+    // Raw MIME must never leak into the body or the excerpt.
+    expect(msg.text ?? '').not.toContain('Content-Type:');
+    expect(msg.excerpt).not.toContain('Content-Type:');
+  });
+
+  it('decodes a non-utf8 body using the part charset', async () => {
+    getDb().prepare(
+      `INSERT INTO imap_accounts (id, host, port, user, password, domain) VALUES ('charset-acct', 'imap.test.com', 993, 'u', 'p', 'example.com')`,
+    ).run();
+    // "中文" in GBK; a blind toString('utf8') turns this into mojibake.
+    const gbk = Buffer.concat([Buffer.from('code 123456 '), Buffer.from([0xd6, 0xd0, 0xce, 0xc4])]);
+    imapMockState.bodyStructure = { type: 'text/plain', parameters: { charset: 'gbk' } };
+    imapMockState.partContents = { '1': { content: gbk, charset: 'gbk' } };
+    imapMockState.downloadCalls = [];
+
+    const p = new ImapProvider();
+    const msg = await p.getMessage(imapInbox('charset-acct', 'x@example.com'), '42');
+
+    expect(msg.text).toBe('code 123456 中文');
+  });
+});
+
+describe('selectBodyParts', () => {
+  it('returns nothing for a non-text single part', () => {
+    expect(selectBodyParts({ type: 'application/pdf' })).toEqual({});
+  });
+
+  it('returns nothing when every leaf is an attachment', () => {
+    expect(selectBodyParts({
+      type: 'multipart/mixed',
+      childNodes: [{ part: '1', type: 'text/plain', disposition: 'attachment' }],
+    })).toEqual({});
+  });
+
+  it('keeps the first candidate when a structure holds several text parts', () => {
+    expect(selectBodyParts({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain' },
+        { part: '2', type: 'text/plain' },
+        { part: '3', type: 'text/html' },
+      ],
+    })).toEqual({ text: '1', html: '3' });
+  });
+
+  it('handles a missing structure', () => {
+    expect(selectBodyParts(undefined)).toEqual({});
+  });
+});
+
+describe('decodeBody', () => {
+  it('falls back to utf8 for an unknown charset label', () => {
+    expect(decodeBody(Buffer.from('hello'), 'not-a-real-charset')).toBe('hello');
+  });
+
+  it('returns an empty string for an empty buffer', () => {
+    expect(decodeBody(Buffer.alloc(0), 'utf-8')).toBe('');
+  });
+});
+
+describe('randomUsername', () => {
+  const SAMPLES = Array.from({ length: 3000 }, () => randomUsername());
+
+  it.each([
+    ['is a mail-safe local part', (u: string) => expect(u).toMatch(/^[a-z]+([._][a-z]+)?[0-9]{0,2}$/)],
+    ['never leads with a separator', (u: string) => expect(u).not.toMatch(/^[._]/)],
+    ['never trails with a separator', (u: string) => expect(u).not.toMatch(/[._]$/)],
+    ['never doubles a separator', (u: string) => expect(u).not.toMatch(/[._]{2}/)],
+    ['stays a plausible length', (u: string) => {
+      expect(u.length).toBeGreaterThanOrEqual(4);
+      expect(u.length).toBeLessThanOrEqual(24);
+    }],
+  ])('every sample %s', (_name, assert) => {
+    for (const u of SAMPLES) assert(u);
+  });
+
+  it('mixes all three separator shapes rather than settling on one', () => {
+    expect(SAMPLES.some((u) => /^[a-z]+[0-9]{0,2}$/.test(u))).toBe(true);
+    expect(SAMPLES.some((u) => u.includes('.'))).toBe(true);
+    expect(SAMPLES.some((u) => u.includes('_'))).toBe(true);
+  });
+
+  it('mixes full first names with single initials', () => {
+    const separated = SAMPLES.filter((u) => /[._]/.test(u)).map((u) => u.split(/[._]/)[0]);
+    expect(separated.some((given) => given.length === 1)).toBe(true);
+    expect(separated.some((given) => given.length > 1)).toBe(true);
+  });
+
+  it('adds a digit suffix only some of the time', () => {
+    const withDigits = SAMPLES.filter((u) => /[0-9]$/.test(u)).length;
+    expect(withDigits).toBeGreaterThan(0);
+    expect(withDigits).toBeLessThan(SAMPLES.length);
+  });
+});
+
+describe('generateUniqueUsername', () => {
+  const holdAddress = (id: string, address: string, status: string): void => {
+    getDb().prepare(
+      `INSERT INTO inboxes (id, provider, address, auth_data, status) VALUES (?, 'imap', ?, '{}', ?)`,
+    ).run(id, address, status);
+  };
+
+  it('skips a username a live inbox already holds', () => {
+    holdAddress('held', 'taken@example.com', 'active');
+    const draws = ['taken', 'taken', 'free'];
+    let i = 0;
+    expect(generateUniqueUsername('example.com', () => draws[i++])).toBe('free');
+  });
+
+  it('reuses an address once the holding inbox is closed', () => {
+    holdAddress('gone', 'taken@example.com', 'closed');
+    expect(generateUniqueUsername('example.com', () => 'taken')).toBe('taken');
+  });
+
+  it('only treats a collision on the same domain as a collision', () => {
+    holdAddress('other', 'taken@other.com', 'active');
+    expect(generateUniqueUsername('example.com', () => 'taken')).toBe('taken');
+  });
+
+  it('falls back to a random suffix when every draw collides', () => {
+    holdAddress('held', 'taken@example.com', 'active');
+    expect(generateUniqueUsername('example.com', () => 'taken')).toMatch(/^taken[a-z0-9]{4}$/);
   });
 });

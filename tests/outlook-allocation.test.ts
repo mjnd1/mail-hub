@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { dispatch } from '../src/dispatcher.js';
 import { allRows, getDb, getRow } from '../src/db.js';
 import { OutlookProvider } from '../src/providers/outlook.js';
+import { app, authHeaders, jsonHeaders } from './helpers/http.js';
 
 describe('Outlook account allocation', () => {
   it('reserves the selected account with the final inbox id during creation', async () => {
@@ -118,5 +119,68 @@ describe('Outlook account allocation', () => {
       'three@open.test',
       'two@open.test',
     ]);
+  });
+
+  it('does not record the service on a failure report by default, and the settings endpoint agrees (regression)', async () => {
+    const db = getDb();
+    db.prepare(
+      `INSERT INTO outlook_accounts (email, password, client_id, refresh_token, token_status)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run('unset@outlook.test', 'pw', 'client', 'refresh', 'valid');
+    const created = await dispatch({ provider: 'outlook', for: 'svc-unset.com' });
+
+    // No settings row exists. used_services is an irreversible blacklist, so a
+    // failure must not burn the account for that service unless the operator
+    // opted in — and the settings endpoint must report the same default, not
+    // the opposite of what the report path does.
+    const res = await app.request(`/api/inbox/${created.id}/report`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ success: false }),
+    });
+    expect(res.status).toBe(200);
+
+    const settingsRes = await app.request('/api/outlook/settings', { headers: authHeaders() });
+    const settings = await settingsRes.json() as { recordFailService: boolean };
+    expect(settings.recordFailService).toBe(false);
+
+    const account = getRow<{ used_services: string }>(
+      db,
+      `SELECT used_services FROM outlook_accounts WHERE email = ?`,
+      'unset@outlook.test',
+    );
+    expect(JSON.parse(account!.used_services)).toEqual([]);
+  });
+
+  it('records the service on a failure report once the operator opts in', async () => {
+    const db = getDb();
+    db.prepare(
+      `INSERT INTO outlook_accounts (email, password, client_id, refresh_token, token_status)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run('optin@outlook.test', 'pw', 'client', 'refresh', 'valid');
+
+    const patched = await app.request('/api/outlook/settings', {
+      method: 'PATCH',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ recordFailService: true }),
+    });
+    expect(patched.status).toBe(200);
+
+    const created = await dispatch({ provider: 'outlook', for: 'svc-optin.com' });
+    await app.request(`/api/inbox/${created.id}/report`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ success: false }),
+    });
+
+    const settingsRes = await app.request('/api/outlook/settings', { headers: authHeaders() });
+    expect(((await settingsRes.json()) as { recordFailService: boolean }).recordFailService).toBe(true);
+
+    const account = getRow<{ used_services: string }>(
+      db,
+      `SELECT used_services FROM outlook_accounts WHERE email = ?`,
+      'optin@outlook.test',
+    );
+    expect(JSON.parse(account!.used_services)).toEqual(['svc-optin.com']);
   });
 });

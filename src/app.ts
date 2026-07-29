@@ -13,13 +13,13 @@ import { imapRoutes } from './routes/imap.js';
 import { serviceRoutes } from './routes/services.js';
 import { templateProviderRoutes } from './routes/template-providers.js';
 import { allRows, DEFAULT_SETTINGS, getDb, getRow, getSetting, logActivity } from './db.js';
-import { hashApiKey } from './crypto.js';
-import type { AdminEnv } from './routes/admin.js';
+import { hashApiKey, secureCompare } from './crypto.js';
+import { requireAdmin, type AdminEnv } from './routes/admin.js';
 import { parseStoredInbox, releaseInboxResources } from './inbox-lifecycle.js';
 import { checkToken } from './providers/outlook.js';
 import { createLogger } from './logger.js';
 import { settingsRoutes } from './routes/settings.js';
-import { todayDateString } from './utils.js';
+import { runConcurrent, todayDateString } from './utils.js';
 import { APP_VERSION } from './version.js';
 import { errorMessage, httpStatus, jsonStatus } from './errors.js';
 import { requestLogger } from './request-logger.js';
@@ -99,6 +99,7 @@ Request body (JSON):
     "provider": "mailtm",      // (optional) force a specific provider
     "domain": "example.com",   // (optional) request a specific email domain
     "subdomain": "team-a",    // (optional) wildcard child domain prefix (YYDS provider only)
+    "alias": true,             // (optional) ask for a sub-address — see "Aliases" below
     "duration": 600,           // (optional) desired lifetime in seconds
     "needPolling": true        // (optional, default true) whether inbox must support polling
   }
@@ -108,7 +109,7 @@ Response 201:
     "id": "abc123",
     "address": "random@tmpmail.org",
     "provider": "mailtm",
-    "expiresAt": "2025-01-01T01:00:00Z",  // may be null
+    "expiresAt": "2025-01-01T01:00:00Z",  // always set; defaults to 24h when neither provider nor "duration" specify one
     "features": { "pollInbox": true, "attachments": false, ... }
   }
 
@@ -116,8 +117,28 @@ Response 201:
 "discord.com", "steam.com"). It is used for:
   - Avoiding domains already blocked by that service
   - Preventing Outlook accounts from being reused for the same service
+    (unless "alias" is set — see below)
   - Statistics and management tracking by the service operator
 Do NOT omit this field. The service operator requires it for management purposes.
+
+#### Aliases ("alias": true)
+
+Asks for a sub-address instead of the plain one. The tag is generated
+server-side — do NOT try to supply it. Only providers advertising
+"features.alias" honour it (currently Outlook, which returns
+account+tag@outlook.com); others ignore it silently, so with auto-dispatch you
+may still receive a plain address. Always read "address" from the response.
+
+Normally one Outlook account is handed to a given "for" service only once.
+An aliased request bypasses that limit, so the same account can register at the
+same service repeatedly, each time with a fresh address. Two things to know:
+
+  - Many signup forms reject addresses containing "+". This is why the flag is
+    opt-in per request rather than always on — use it only for services you
+    know accept sub-addressing.
+  - An alias is a different address, NOT extra capacity: the inbox still holds
+    one pooled account, so repeat registrations are sequential. Close the
+    current inbox before creating the next one.
 
 ### GET /api/inboxes
 List your inboxes.
@@ -272,8 +293,13 @@ PATCH  /api/yyds/accounts/wildcard      — Set wildcard support (body: { "keys"
 ### IMAP / Custom Domain Email
 
 Connect your own domain email via IMAP. One IMAP account with catch-all
-enabled serves as a pool resource — the dispatcher generates random
-addresses under your domain (e.g. x7k2@mydomain.com).
+enabled serves as a pool resource — the dispatcher invents an address
+under your domain for each inbox and sorts the shared mailbox by
+recipient, so one mailbox backs many concurrent inboxes.
+
+Generated local parts are name-shaped rather than a random string
+(nathanlambert, lisa.chen, d_watson91, vera.oconnell8); pass "username"
+to choose your own. Addresses in use by a live inbox are never reissued.
 
 Prerequisites (done outside Mail Hub):
   - A domain with catch-all email enabled
@@ -281,7 +307,7 @@ Prerequisites (done outside Mail Hub):
 
 Usage:
   POST /api/inbox { "provider": "imap", "for": "twitter.com", "domain": "mydomain.com" }
-  → address: "random@mydomain.com"
+  → address: "juliahoffman@mydomain.com"
 
 The "domain" field is optional — if omitted, a random configured domain is picked.
 Auto-dispatch: on by default (free). IMAP is scored with high trust (trustLevel=10)
@@ -386,7 +412,7 @@ export function createApp(): Hono<AdminEnv> {
     const token = auth?.startsWith('Bearer ') ? auth.slice(7) : '';
     if (!token) return c.json({ error: 'Unauthorized' }, 401);
 
-    if (token === config.apiSecret) {
+    if (secureCompare(token, config.apiSecret)) {
       c.set('isAdmin', true);
       c.set('apiKey', token);
       return next();
@@ -460,7 +486,7 @@ export function createApp(): Hono<AdminEnv> {
   app.route('/api', templateProviderRoutes);
   app.route('/api', settingsRoutes);
 
-  app.get('/api/activity', (c) => {
+  app.get('/api/activity', requireAdmin, (c) => {
     const db = getDb();
     const rows = allRows<{ type: string; text: string; created_at: string }>(
       db,
@@ -481,9 +507,31 @@ export async function cleanupExpired(): Promise<void> {
     const retentionInboxDays = Math.max(1, parseInt(getSetting('retention_inbox_days', DEFAULT_SETTINGS.retention_inbox_days), 10) || 7);
     const retentionFailLogDays = Math.max(1, parseInt(getSetting('retention_faillog_days', DEFAULT_SETTINGS.retention_faillog_days), 10) || 7);
     const retentionActivityDays = Math.max(1, parseInt(getSetting('retention_activity_days', DEFAULT_SETTINGS.retention_activity_days), 10) || 30);
-    db.prepare(`UPDATE inboxes SET status = 'closed' WHERE expires_at IS NOT NULL AND datetime(expires_at) < datetime('now') AND status = 'active'`)
-      .run();
 
+    // 1. Close expired inboxes and release their pool resources immediately,
+    //    so Outlook accounts / YYDS slots return to the pool at expiry time
+    //    instead of waiting for the purge a day later.
+    const expired = allRows<{ id: string; provider: string; address: string; auth_data: string; api_base: string | null }>(db, `
+      SELECT id, provider, address, auth_data, api_base
+      FROM inboxes
+      WHERE status = 'active' AND expires_at IS NOT NULL AND datetime(expires_at) < datetime('now')
+    `);
+    if (expired.length > 0) {
+      const close = db.prepare(`UPDATE inboxes SET status = 'closed', closed_at = datetime('now') WHERE id = ?`);
+      for (const row of expired) close.run(row.id);
+      for (const row of expired) {
+        try {
+          await releaseInboxResources(parseStoredInbox(row), { deleteExternal: false });
+        } catch (e) {
+          log.error('failed to release inbox resources', { inboxId: row.id, error: errorMessage(e) });
+        }
+      }
+      log.info('closed expired inboxes', { count: expired.length });
+    }
+
+    // 2. Purge old closed inboxes. Releasing again is near-idempotent (YYDS
+    //    inbox_count may double-decrement, it is display-only and floored at 0)
+    //    and catches rows closed before release-at-expiry existed.
     const rows = allRows<{ id: string; provider: string; address: string; auth_data: string; api_base: string | null }>(db, `
       SELECT id, provider, address, auth_data, api_base
       FROM inboxes
@@ -508,6 +556,26 @@ export async function cleanupExpired(): Promise<void> {
       }
       log.info('purged expired inboxes', { count: rows.length });
     }
+
+    // 3. Retention purges run before any network-dependent work so an upstream
+    //    outage can never starve them.
+    db.prepare(`DELETE FROM fail_log WHERE datetime(reported_at) < datetime('now', ?)`).run(`-${retentionFailLogDays} days`);
+    db.prepare(`DELETE FROM activity_log WHERE datetime(created_at) < datetime('now', ?)`).run(`-${retentionActivityDays} days`);
+
+    // 4. Free Outlook accounts whose assigned inbox no longer exists (process
+    //    crashed between pool claim and inbox insert, or row purged abnormally).
+    const reaped = db.prepare(
+      `UPDATE outlook_accounts SET assigned_inbox_id = NULL
+       WHERE assigned_inbox_id IS NOT NULL
+         AND assigned_inbox_id NOT IN (SELECT id FROM inboxes)`,
+    ).run();
+    if (reaped.changes > 0) {
+      log.info('released orphaned Outlook assignments', { count: reaped.changes });
+    }
+
+    // 5. Daily Outlook token check. 'unknown' (network/throttle/5xx) must never
+    //    flip token_status — the purge below deletes invalid accounts, and an
+    //    upstream outage must not wipe the pool.
     const toCheck = allRows<{ email: string; client_id: string; refresh_token: string }>(db, `
       SELECT email, client_id, refresh_token FROM outlook_accounts
       WHERE account_type = 'short'
@@ -517,31 +585,35 @@ export async function cleanupExpired(): Promise<void> {
     `);
 
     if (toCheck.length > 0) {
+      const concurrency = Math.max(1, parseInt(getSetting('batch_concurrency', DEFAULT_SETTINGS.batch_concurrency), 10) || 5);
       let invalidCount = 0;
-      for (const { email, client_id: clientId, refresh_token: refreshToken } of toCheck) {
-        const { valid } = await checkToken(email, clientId, refreshToken);
-        db.prepare(
-          `UPDATE outlook_accounts SET token_status = ?, last_checked_at = datetime('now') WHERE email = ?`,
-        ).run(valid ? 'valid' : 'invalid', email);
-        if (!valid) invalidCount++;
-      }
+      let unknownCount = 0;
+      await runConcurrent(toCheck, concurrency, async ({ email, client_id: clientId, refresh_token: refreshToken }) => {
+        try {
+          const { status } = await checkToken(email, clientId, refreshToken);
+          if (status === 'unknown') {
+            unknownCount++;
+            db.prepare(`UPDATE outlook_accounts SET last_checked_at = datetime('now') WHERE email = ?`).run(email);
+          } else {
+            if (status === 'invalid') invalidCount++;
+            db.prepare(`UPDATE outlook_accounts SET token_status = ?, last_checked_at = datetime('now') WHERE email = ?`).run(status, email);
+          }
+        } catch (e) {
+          unknownCount++;
+          log.warn('Outlook token check errored, leaving account status untouched', { email, error: errorMessage(e) });
+        }
+      });
 
       const deleted = getRow<{ count: number }>(
         db,
         `SELECT COUNT(*) AS count FROM outlook_accounts WHERE account_type = 'short' AND token_status = 'invalid' AND assigned_inbox_id IS NULL`,
       ) ?? { count: 0 };
-      const deleteCount = deleted.count;
-      if (deleteCount > 0) {
+      if (deleted.count > 0) {
         db.prepare(`DELETE FROM outlook_accounts WHERE account_type = 'short' AND token_status = 'invalid' AND assigned_inbox_id IS NULL`).run();
-        log.info('purged invalid short-term Outlook accounts', { count: deleteCount });
+        log.info('purged invalid short-term Outlook accounts', { count: deleted.count });
       }
-      if (toCheck.length > 0) {
-        log.info('Outlook token check complete', { checked: toCheck.length, invalid: invalidCount });
-      }
+      log.info('Outlook token check complete', { checked: toCheck.length, invalid: invalidCount, unknown: unknownCount });
     }
-
-    db.prepare(`DELETE FROM fail_log WHERE datetime(reported_at) < datetime('now', ?)`).run(`-${retentionFailLogDays} days`);
-    db.prepare(`DELETE FROM activity_log WHERE datetime(created_at) < datetime('now', ?)`).run(`-${retentionActivityDays} days`);
   } catch (e) {
     log.error('cleanup failed', { error: errorMessage(e) });
   } finally {

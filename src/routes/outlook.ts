@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { allRows, getDb, getRow, getSetting, logActivity, setSetting } from '../db.js';
-import { checkToken, renewToken } from '../providers/outlook.js';
+import { checkToken, fetchAccountMailbox, fetchAccountMessage, OAuthRejectedError, renewToken } from '../providers/outlook.js';
+import { parseInboxTimestamp } from '../inbox-lifecycle.js';
 import { requireAdmin, type AdminEnv } from './admin.js';
 import { importDelimited } from '../import-utils.js';
 import { fetchWithTimeout, runConcurrent } from '../utils.js';
@@ -312,7 +313,7 @@ async function completeOAuthCodeExchange(session: OAuthSessionRow, code: string)
     `).run(session.client_id, exchanged.refresh_token, session.id, session.email);
 
     const checked = await checkToken(session.email, session.client_id, exchanged.refresh_token);
-    if (!checked.valid) {
+    if (checked.status === 'invalid') {
       const message = 'Refresh token saved, but token validation failed';
       db.prepare(`
         UPDATE outlook_accounts
@@ -323,6 +324,19 @@ async function completeOAuthCodeExchange(session: OAuthSessionRow, code: string)
       `).run(message, session.email);
       db.prepare(`UPDATE outlook_oauth_sessions SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?`).run(message, session.id);
       return { ok: false, message };
+    }
+    if (checked.status === 'unknown') {
+      // Token exchange itself succeeded; validation was inconclusive (network /
+      // throttling). Keep the account allocable and let the daily check settle it.
+      db.prepare(`
+        UPDATE outlook_accounts
+        SET token_status = '',
+            oauth_last_error = NULL,
+            last_checked_at = NULL
+        WHERE email = ?
+      `).run(session.email);
+      db.prepare(`UPDATE outlook_oauth_sessions SET status = 'completed', error = '', updated_at = datetime('now') WHERE id = ?`).run(session.id);
+      return { ok: true, message: 'Refresh token saved (validation deferred: upstream unreachable)' };
     }
     db.prepare(`
       UPDATE outlook_accounts
@@ -604,9 +618,13 @@ outlookRoutes.get('/outlook/accounts', (c) => {
   const group = c.req.query('group');
 
   const type = c.req.query('type');
+  const q = c.req.query('q');
 
+  // last_inbox_id matches on auth_data.email, not address: with plus addressing
+  // an inbox's address is `local+tag@domain` while the account is `local@domain`,
+  // so an address join would report "never used" for every alias inbox.
   let sql = `SELECT oa.email, oa.token_status, oa.assigned_inbox_id, oa.group_name, oa.account_type, oa.created_at, oa.token_renewed_at, oa.last_checked_at, oa.oauth_last_error,
-             (SELECT id FROM inboxes WHERE provider='outlook' AND address=oa.email ORDER BY created_at DESC LIMIT 1) as last_inbox_id
+             (SELECT id FROM inboxes WHERE provider='outlook' AND COALESCE(json_extract(auth_data, '$.email'), address) = oa.email ORDER BY created_at DESC LIMIT 1) as last_inbox_id
              FROM outlook_accounts oa WHERE 1=1`;
   const conditions: string[] = [];
   const params: string[] = [];
@@ -627,6 +645,11 @@ outlookRoutes.get('/outlook/accounts', (c) => {
     conditions.push(`account_type = ?`);
     params.push(type);
   }
+  if (q) {
+    const escaped = `%${q.replace(/[%_\\]/g, '\\$&')}%`;
+    conditions.push(`(email LIKE ? ESCAPE '\\' OR COALESCE(group_name, '') LIKE ? ESCAPE '\\')`);
+    params.push(escaped, escaped);
+  }
 
   if (conditions.length) sql += ' AND ' + conditions.join(' AND ');
   sql += ' ORDER BY created_at DESC';
@@ -634,6 +657,141 @@ outlookRoutes.get('/outlook/accounts', (c) => {
   const accounts = db.prepare(sql).all(...params);
 
   return c.json({ accounts });
+});
+
+/**
+ * Same slack isMessageWithinInboxLifetime() uses, for the same reason: the mail
+ * host's clock is not ours. Kept equal so a message the inbox view calls "mine"
+ * is never filed under a different lease here.
+ */
+const LEASE_SLACK_MS = 60000;
+
+const MAILBOX_DEFAULT_LIMIT = 50;
+const MAILBOX_MAX_LIMIT = 100;
+
+interface LeaseRow {
+  id: string;
+  address: string;
+  target_service: string | null;
+  created_at: string;
+  closed_at: string | null;
+  expires_at: string | null;
+  status: string;
+}
+
+interface Lease {
+  id: string;
+  address: string;
+  targetService: string | null;
+  createdAt: string;
+  endedAt: string | null;
+  status: string;
+  startMs: number;
+  endMs: number;
+}
+
+/**
+ * Every lease this account has served, newest first, each with the real window
+ * it owned the mailbox for.
+ *
+ * The end of a lease is whichever came first: it was closed (closed_at), it
+ * expired (expires_at — the PLANNED end, so only a fallback for rows closed
+ * before closed_at existed), or the account was handed to the next lease. That
+ * last cap is what makes rows with no recorded end still land somewhere honest:
+ * a lease can never have owned the mailbox past the moment the next one started.
+ */
+function accountLeases(email: string): Lease[] {
+  const rows = allRows<LeaseRow>(
+    getDb(),
+    `SELECT id, address, target_service, created_at, closed_at, expires_at, status
+     FROM inboxes
+     WHERE provider = 'outlook' AND COALESCE(json_extract(auth_data, '$.email'), address) = ?
+     ORDER BY datetime(created_at) DESC`,
+    email,
+  );
+
+  const leases: Lease[] = [];
+  for (const [index, row] of rows.entries()) {
+    const startMs = parseInboxTimestamp(row.created_at) - LEASE_SLACK_MS;
+    const recordedEnd = row.status === 'active' ? '' : (row.closed_at || row.expires_at || '');
+    const explicitEnd = recordedEnd ? parseInboxTimestamp(recordedEnd) : Infinity;
+    // rows are newest-first, so the lease that superseded this one is at index-1.
+    const nextStart = index > 0 ? leases[index - 1].startMs : Infinity;
+    const endMs = Math.max(startMs, Math.min(explicitEnd || Infinity, nextStart));
+    leases.push({
+      id: row.id,
+      address: row.address,
+      targetService: row.target_service,
+      createdAt: row.created_at,
+      endedAt: Number.isFinite(endMs) ? new Date(endMs).toISOString() : null,
+      status: row.status,
+      startMs,
+      endMs,
+    });
+  }
+  return leases;
+}
+
+type LeaseState = 'lease' | 'gap' | 'before' | 'undated';
+
+function classifyMessage(receivedAt: string | undefined, leases: Lease[]): { leaseId: string | null; leaseState: LeaseState } {
+  if (!receivedAt) return { leaseId: null, leaseState: 'undated' };
+  const t = Date.parse(receivedAt);
+  if (!Number.isFinite(t)) return { leaseId: null, leaseState: 'undated' };
+  for (const lease of leases) {
+    if (t >= lease.startMs && t <= lease.endMs) return { leaseId: lease.id, leaseState: 'lease' };
+  }
+  const oldest = leases[leases.length - 1];
+  if (oldest && t < oldest.startMs) return { leaseId: null, leaseState: 'before' };
+  return { leaseId: null, leaseState: 'gap' };
+}
+
+/**
+ * The account's mailbox, not an inbox's view of it. An inbox is a lease and its
+ * message list stays clipped to that lease — widening it would put a previous
+ * tenant's verification codes back in front of a caller. This route answers the
+ * other question, "what else is in this mailbox", and only for an admin (the
+ * whole /outlook/* tree is behind requireAdmin).
+ *
+ * `limit` is a real ceiling, not paging: Graph is asked for the newest N of
+ * Inbox and Junk each, merged down to N. Older mail exists upstream and is not
+ * reachable from here.
+ */
+outlookRoutes.get('/outlook/accounts/:email/mailbox', async (c) => {
+  const email = c.req.param('email');
+  const exists = getRow<{ email: string }>(getDb(), `SELECT email FROM outlook_accounts WHERE email = ?`, email);
+  if (!exists) return c.json({ error: 'Outlook account not found' }, 404);
+
+  const requested = parseInt(c.req.query('limit') || '', 10);
+  const limit = Number.isFinite(requested)
+    ? Math.min(MAILBOX_MAX_LIMIT, Math.max(1, requested))
+    : MAILBOX_DEFAULT_LIMIT;
+
+  const leases = accountLeases(email);
+
+  try {
+    const messages = await fetchAccountMailbox(email, limit);
+    return c.json({
+      email,
+      limit,
+      truncated: messages.length >= limit,
+      messages: messages.map((m) => ({ ...m, ...classifyMessage(m.receivedAt, leases) })),
+      leases: leases.map(({ startMs: _s, endMs: _e, ...rest }) => rest),
+    });
+  } catch (e) {
+    return c.json({ error: errorMessage(e) }, 502);
+  }
+});
+
+outlookRoutes.get('/outlook/accounts/:email/mailbox/:mid', async (c) => {
+  const email = c.req.param('email');
+  const exists = getRow<{ email: string }>(getDb(), `SELECT email FROM outlook_accounts WHERE email = ?`, email);
+  if (!exists) return c.json({ error: 'Outlook account not found' }, 404);
+  try {
+    return c.json(await fetchAccountMessage(email, c.req.param('mid')));
+  } catch (e) {
+    return c.json({ error: errorMessage(e) }, 502);
+  }
 });
 
 outlookRoutes.delete('/outlook/accounts', async (c) => {
@@ -682,25 +840,30 @@ outlookRoutes.post('/outlook/check', async (c) => {
   }
 
   const checked = await runConcurrent(withToken, concurrency, async (row) => {
-    const { valid, apiType } = await checkToken(row.email, row.client_id, row.refresh_token);
+    const { status, apiType } = await checkToken(row.email, row.client_id, row.refresh_token);
+    if (status === 'unknown') {
+      db.prepare(`UPDATE outlook_accounts SET last_checked_at = datetime('now') WHERE email = ?`).run(row.email);
+      return { email: row.email, valid: false, status };
+    }
     const updates = [`token_status = ?`];
-    const params: any[] = [valid ? 'valid' : 'invalid'];
+    const params: unknown[] = [status];
     if (apiType) { updates.push(`api_type = ?`); params.push(apiType); }
-    params.push(row.email);
     updates.push(`last_checked_at = datetime('now')`);
+    params.push(row.email);
     db.prepare(`UPDATE outlook_accounts SET ${updates.join(', ')} WHERE email = ?`).run(...params);
-    return { email: row.email, valid, apiType };
+    return { email: row.email, valid: status === 'valid', status, apiType };
   });
 
   const results = [
-    ...noToken.map(row => ({ email: row.email, valid: false as const })),
+    ...noToken.map(row => ({ email: row.email, valid: false, status: 'no_token' as const })),
     ...checked,
   ];
 
   return c.json({
     checked: results.length,
-    valid: results.filter((r) => r.valid).length,
-    invalid: results.filter((r) => !r.valid).length,
+    valid: results.filter((r) => r.status === 'valid').length,
+    invalid: results.filter((r) => r.status === 'invalid' || r.status === 'no_token').length,
+    unknown: results.filter((r) => r.status === 'unknown').length,
     results,
   });
 });
@@ -724,18 +887,27 @@ outlookRoutes.post('/outlook/renew', async (c) => {
     (row.client_id && row.refresh_token ? withToken : noToken).push(row);
   }
 
-  const noTokenResults = noToken.map(row => ({ email: row.email, renewed: false }));
+  const noTokenResults = noToken.map(row => ({ email: row.email, renewed: false, status: 'no_token' }));
 
   const checked = await runConcurrent(withToken, concurrency, async (row) => {
-    const result = await renewToken(row.client_id, row.refresh_token);
-    if (result) {
-      db.prepare(
-        `UPDATE outlook_accounts SET refresh_token = ?, token_status = 'valid', token_renewed_at = datetime('now') WHERE email = ?`,
-      ).run(result.newRefreshToken, row.email);
-      return { email: row.email, renewed: true };
+    try {
+      const result = await renewToken(row.client_id, row.refresh_token);
+      if (result) {
+        db.prepare(
+          `UPDATE outlook_accounts SET refresh_token = ?, token_status = 'valid', token_renewed_at = datetime('now') WHERE email = ?`,
+        ).run(result.newRefreshToken, row.email);
+        return { email: row.email, renewed: true, status: 'renewed' };
+      }
+      // Endpoint accepted the token but did not rotate it — still a live token.
+      return { email: row.email, renewed: false, status: 'not_rotated' };
+    } catch (e) {
+      if (e instanceof OAuthRejectedError) {
+        db.prepare(`UPDATE outlook_accounts SET token_status = 'invalid' WHERE email = ?`).run(row.email);
+        return { email: row.email, renewed: false, status: 'invalid' };
+      }
+      // Network / throttling / 5xx — leave the stored status untouched.
+      return { email: row.email, renewed: false, status: 'unknown' };
     }
-    db.prepare(`UPDATE outlook_accounts SET token_status = 'invalid' WHERE email = ?`).run(row.email);
-    return { email: row.email, renewed: false };
   });
 
   const results = [...noTokenResults, ...checked];
@@ -788,7 +960,9 @@ outlookRoutes.get('/outlook/stats', (c) => {
 
 outlookRoutes.get('/outlook/settings', (c) => {
   return c.json({
-    recordFailService: getSetting('outlook_record_fail_service') !== '0',
+    // Opt-in, matching the report path (`=== '1'`): unset means failures do
+    // not record the service.
+    recordFailService: getSetting('outlook_record_fail_service') === '1',
     batchConcurrency: parseInt(getSetting('batch_concurrency', '5'), 10) || 5,
     oauthClientId: getSetting('outlook_oauth_client_id', config.outlookOAuthClientId),
     oauthRedirectUri: getSetting('outlook_oauth_redirect_uri', config.outlookOAuthRedirectUri),

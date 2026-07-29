@@ -11,11 +11,13 @@ let initDb: () => Database.Database;
 let getDb: () => Database.Database;
 let registerAllProviders: () => void;
 let rateLimiter: { reset(): void; getCreateStatus(provider: string): RateLimitStatus };
+let resetTokenCache: () => void;
 
 beforeAll(async () => {
   ({ initDb, getDb } = await import('../src/db.js'));
   ({ registerAllProviders } = await import('../src/providers/index.js'));
   ({ rateLimiter } = await import('../src/rate-limiter.js'));
+  ({ resetTokenCache } = await import('../src/providers/outlook.js'));
 
   if (existsSync(process.env.DB_PATH!)) unlinkSync(process.env.DB_PATH!);
   initDb();
@@ -36,6 +38,7 @@ beforeEach(() => {
     'settings',
     'api_keys',
     'fail_log',
+    'service_stats',
     'block_rules',
     'activity_log',
     'template_providers',
@@ -44,6 +47,7 @@ beforeEach(() => {
   }
   registerAllProviders();
   rateLimiter.reset();
+  resetTokenCache();
 });
 
 afterAll(() => {

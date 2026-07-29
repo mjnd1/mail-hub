@@ -5,10 +5,11 @@ import { dispatch, getDomainAtLevel } from '../dispatcher.js';
 import { registry } from '../providers/registry.js';
 import { rateLimiter } from '../rate-limiter.js';
 import { extractCodes } from '../code-extractor.js';
-import { allRows, getDb, getRow, getSetting, logActivity } from '../db.js';
-import { parseStoredInbox, releaseInboxResources, rowToInboxData } from '../inbox-lifecycle.js';
+import { allRows, bumpServiceReported, getDb, getRow, getSetting, logActivity } from '../db.js';
+import { isMessageWithinInboxLifetime, parseInboxTimestamp, parseStoredInbox, releaseInboxResources, rowToInboxData } from '../inbox-lifecycle.js';
 import type { BaseProvider, InboxData, Message, MessageDetail } from '../providers/base.js';
 import { PROVIDER } from '../providers/base.js';
+import { stripPlusTag } from '../providers/outlook.js';
 import type { AdminEnv } from './admin.js';
 import { createLogger } from '../logger.js';
 import { errorMessage, httpStatus } from '../errors.js';
@@ -91,6 +92,19 @@ function getInboxRow<T extends object>(c: AppContext, id: string, columns: strin
   return getRow<T>(db, scoped.sql, ...scoped.params);
 }
 
+/**
+ * The Outlook account behind an inbox. With plus addressing the inbox address
+ * is `local+tag@domain` while the account row is keyed on `local@domain`, so
+ * `auth_data.email` — written by the provider and holding the account identity
+ * verbatim — is the authoritative source. Falls back to the stripped address
+ * for rows written before that field existed.
+ */
+function accountEmailForInbox(db: Database.Database, c: AppContext, id: string, address: string): string {
+  const scoped = addOwnerScope(c, `SELECT json_extract(auth_data, '$.email') AS email FROM inboxes WHERE id = ?`, [id]);
+  const row = getRow<{ email: string | null }>(db, scoped.sql, ...scoped.params);
+  return row?.email || stripPlusTag(address);
+}
+
 class PollRateLimitError extends Error {
   retryAfter: string | null;
 
@@ -131,6 +145,7 @@ inboxRoutes.post('/inbox', async (c) => {
       domain: body.domain,
       subdomain: body.subdomain,
       username: body.username,
+      alias: body.alias === true,
       duration: body.duration,
       needPolling: body.needPolling,
       ownerKey: c.get('apiKey'),
@@ -199,7 +214,7 @@ inboxRoutes.get('/inbox/:id', (c) => {
 
 inboxRoutes.get('/inbox/:id/messages', async (c) => {
   const id = c.req.param('id');
-  const row = getInboxRow<InboxDataRow>(c, id, 'provider, address, auth_data, api_base, status');
+  const row = getInboxRow<InboxDataRow>(c, id, 'provider, address, auth_data, api_base, status, created_at');
   if (!row) {
     return c.json({ error: 'Inbox not found' }, 404);
   }
@@ -217,9 +232,21 @@ inboxRoutes.get('/inbox/:id/messages', async (c) => {
     }, 400);
   }
 
+  const inboxCreatedAt = parseInboxTimestamp(row.created_at);
+  const inbox = rowToInboxData(row);
+  // The account behind the lease, so a client can offer the mailbox view without
+  // guessing it back out of an alias address. Outlook only: it is the one pool
+  // where a mailbox serves exactly one lease at a time, so showing the rest of
+  // it exposes nothing that is not this same caller's history. YYDS keys and
+  // IMAP catch-alls are shared across concurrent inboxes and get no such link.
+  const accountEmail = providerName === PROVIDER.OUTLOOK
+    ? (inbox.authData.email || stripPlusTag(address))
+    : undefined;
+
   try {
-    const messages = await pollProvider(providerName, provider, rowToInboxData(row));
-    return c.json({ messages, status, address, provider: providerName });
+    const messages = await pollProvider(providerName, provider, inbox);
+    const own = messages.filter((m) => isMessageWithinInboxLifetime(m.receivedAt, inboxCreatedAt));
+    return c.json({ messages: own, status, address, provider: providerName, accountEmail });
   } catch (e) {
     if (e instanceof PollRateLimitError) return pollRateLimitResponse(c, e);
     return c.json({ error: errorMessage(e) }, 502);
@@ -229,7 +256,7 @@ inboxRoutes.get('/inbox/:id/messages', async (c) => {
 inboxRoutes.get('/inbox/:id/messages/:mid', async (c) => {
   const id = c.req.param('id');
   const mid = c.req.param('mid');
-  const row = getInboxRow<InboxDataRow>(c, id, 'provider, address, auth_data, api_base');
+  const row = getInboxRow<InboxDataRow>(c, id, 'provider, address, auth_data, api_base, created_at');
   if (!row) {
     return c.json({ error: 'Inbox not found' }, 404);
   }
@@ -238,8 +265,16 @@ inboxRoutes.get('/inbox/:id/messages/:mid', async (c) => {
   const provider = registry.get(providerName);
   if (!provider) return c.json({ error: `Provider '${providerName}' not available` }, 500);
 
+  const inboxCreatedAt = parseInboxTimestamp(row.created_at);
+
   try {
     const message = await provider.getMessage(rowToInboxData(row), mid);
+    // The id came from a listing we already filtered, but ids are guessable on
+    // some providers and a shared mailbox would happily serve the previous
+    // tenant's message. Re-check the boundary on the detail path too.
+    if (!isMessageWithinInboxLifetime(message.receivedAt, inboxCreatedAt)) {
+      return c.json({ error: 'Message not found' }, 404);
+    }
     return c.json(message);
   } catch (e) {
     return c.json({ error: errorMessage(e) }, 502);
@@ -271,18 +306,20 @@ inboxRoutes.get('/inbox/:id/code', async (c) => {
     return c.json({ error: 'Inbox polling not supported for this provider' }, 400);
   }
 
-  const inboxCreatedAt = createdAt ? new Date(createdAt).getTime() : 0;
+  const inboxCreatedAt = parseInboxTimestamp(createdAt);
 
   const inbox = rowToInboxData(row);
 
   function filterNew(msgs: Message[]): Message[] {
     return msgs.filter(m => {
-      if (!m.receivedAt) return sinceTimestamp === undefined;
-      const receivedAt = new Date(m.receivedAt).getTime();
+      if (!isMessageWithinInboxLifetime(m.receivedAt, inboxCreatedAt)) return false;
+      if (sinceTimestamp === undefined) return true;
+      // `since` is an explicit "strictly newer than" cursor from the caller, so
+      // an undated message cannot satisfy it.
+      if (!m.receivedAt) return false;
+      const receivedAt = Date.parse(m.receivedAt);
       if (!Number.isFinite(receivedAt)) return false;
-      if (inboxCreatedAt && receivedAt < inboxCreatedAt - 60000) return false;
-      if (sinceTimestamp !== undefined && receivedAt <= sinceTimestamp) return false;
-      return true;
+      return receivedAt > sinceTimestamp;
     });
   }
 
@@ -353,7 +390,7 @@ inboxRoutes.delete('/inbox/:id', async (c) => {
   const claimParams: QueryParam[] = [id];
   let claimSql = `
     UPDATE inboxes
-    SET status = 'closed'
+    SET status = 'closed', closed_at = datetime('now')
     WHERE id = ? AND status != 'closed'
   `;
   if (!c.get('isAdmin')) {
@@ -374,16 +411,10 @@ inboxRoutes.delete('/inbox/:id', async (c) => {
   }
 
   const inbox = parseStoredInbox(row);
-  const provider = registry.get(inbox.provider);
-
-  if (provider?.deleteInbox) {
-    try {
-      await releaseInboxResources(inbox, { deleteExternal: true });
-    } catch (error) {
-      log.warn('failed to release inbox resources on delete', { inboxId: id, provider: inbox.provider, error: errorMessage(error) });
-    }
-  } else {
-    await releaseInboxResources(inbox, { deleteExternal: false });
+  try {
+    await releaseInboxResources(inbox, { deleteExternal: true });
+  } catch (error) {
+    log.warn('failed to release inbox resources on delete', { inboxId: id, provider: inbox.provider, error: errorMessage(error) });
   }
 
   logActivity('amber', `Closed inbox ${inbox.address} (${inbox.provider})`);
@@ -394,7 +425,9 @@ inboxRoutes.post('/inbox/:id/report', async (c) => {
   const id = c.req.param('id');
   const body = await c.req.json().catch(() => ({}));
   const success: boolean = body.success ?? false;
-  const service: string | undefined = body.service;
+  // Runtime guard: the type annotation is erased, and a non-string `service`
+  // from an API client must not reach .trim() / SQL binding.
+  const service: string | undefined = typeof body.service === 'string' ? body.service : undefined;
 
   const db = getDb();
   const row = getInboxRow<{ provider: string; address: string; target_service: string | null }>(c, id, 'provider, address, target_service');
@@ -403,13 +436,25 @@ inboxRoutes.post('/inbox/:id/report', async (c) => {
   }
 
   const { provider: providerName, address, target_service: targetService } = row;
-  const svc = service || targetService || undefined;
+  // Trim to the same canonical form dispatch() stores, so fail_log, blocks,
+  // used_services and service_stats all key off one name — an auto-block
+  // inserted under a padded name would be invisible to the dispatcher lookup.
+  const svc = service?.trim() || targetService || undefined;
   const domain = address.split('@')[1];
 
+  // Opt-in: only a success records the service by default. used_services is a
+  // permanent, irreversible blacklist for that account/service pair, so a
+  // failure — which is often transient (rate limit, upstream hiccup) — must not
+  // burn a paid account unless the operator explicitly turns this on.
   const shouldRecordService = success || getSetting('outlook_record_fail_service') === '1';
 
   if (svc && providerName === PROVIDER.OUTLOOK && shouldRecordService) {
-    const email = address;
+    // used_services is keyed on the ACCOUNT email. An alias inbox's address is
+    // `local+tag@domain`, which matches no account row — looking it up verbatim
+    // would silently no-op and leave the anti-reuse blacklist unwritten. Read
+    // the account identity from auth_data, falling back to the stripped address
+    // for rows predating that field.
+    const email = accountEmailForInbox(db, c, id, address);
     const account = getRow<{ used_services: string }>(db, `SELECT used_services FROM outlook_accounts WHERE email = ?`, email);
     if (account) {
       let used: string[] = [];
@@ -422,6 +467,8 @@ inboxRoutes.post('/inbox/:id/report', async (c) => {
       }
     }
   }
+
+  if (svc) bumpServiceReported(svc, success);
 
   if (success) {
     db.prepare(

@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS inboxes (
   owner_key TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   expires_at TEXT,
+  closed_at TEXT,
   status TEXT NOT NULL DEFAULT 'active'
 );
 
@@ -155,6 +156,15 @@ CREATE TABLE IF NOT EXISTS fail_log (
   reported_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS service_stats (
+  name TEXT PRIMARY KEY,
+  inbox_count INTEGER NOT NULL DEFAULT 0,
+  success_count INTEGER NOT NULL DEFAULT 0,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  first_used_at TEXT,
+  last_used_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS activity_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL DEFAULT 'blue',
@@ -190,6 +200,10 @@ export function initDb(): Database.Database {
 
   db = new Database(config.dbPath);
   db.pragma('journal_mode = WAL');
+  // Standard WAL pairing: syncs at checkpoint instead of every commit. Worst
+  // case on OS crash is losing the last moments of writes; scheduled backups
+  // cover that, and all data here is re-importable.
+  db.pragma('synchronous = NORMAL');
 
   db.exec(SCHEMA);
 
@@ -211,6 +225,12 @@ export function initDb(): Database.Database {
     `ALTER TABLE outlook_accounts ADD COLUMN oauth_last_session_id TEXT`,
     `ALTER TABLE outlook_accounts ADD COLUMN oauth_last_error TEXT`,
     `ALTER TABLE outlook_oauth_sessions ADD COLUMN preset TEXT NOT NULL DEFAULT 'custom'`,
+    // When a lease actually ended. expires_at is only ever the PLANNED end, so
+    // an early manual close leaves it in the future; the mailbox view needs the
+    // real boundary to tell "arrived during this lease" from "arrived after it
+    // was released". NULL on rows closed before this column existed, which
+    // callers must read as "end unknown", not "still open".
+    `ALTER TABLE inboxes ADD COLUMN closed_at TEXT`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch (e) {
@@ -221,6 +241,7 @@ export function initDb(): Database.Database {
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_inboxes_status ON inboxes(status);
+    CREATE INDEX IF NOT EXISTS idx_inboxes_provider_address ON inboxes(provider, address);
     CREATE INDEX IF NOT EXISTS idx_inboxes_owner ON inboxes(owner_key);
     CREATE INDEX IF NOT EXISTS idx_inboxes_service ON inboxes(target_service);
     CREATE INDEX IF NOT EXISTS idx_inboxes_expires ON inboxes(expires_at);
@@ -233,6 +254,8 @@ export function initDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_outlook_oauth_state ON outlook_oauth_sessions(state_hash);
     CREATE INDEX IF NOT EXISTS idx_outlook_oauth_status ON outlook_oauth_sessions(status);
   `);
+
+  seedServiceStats(db);
 
   if (config.apiSecret) {
     const unmigrated = allRows<{ key: string }>(db, `SELECT key FROM api_keys WHERE key LIKE 'mk_%'`);
@@ -253,6 +276,31 @@ export function initDb(): Database.Database {
 export function getDb(): Database.Database {
   if (!db) throw new Error('Database not initialized. Call initDb() first.');
   return db;
+}
+
+// Seed durable service stats from whatever history is still retained. Runs
+// every boot but ON CONFLICT DO NOTHING makes it a no-op for services that
+// already have a row — live bumps (bumpServiceCreated/bumpServiceReported)
+// own the counters from then on, so purging old inboxes/fail_log rows no
+// longer erases a service from the stats.
+export function seedServiceStats(database: Database.Database): void {
+  database.exec(`
+    INSERT INTO service_stats (name, inbox_count, fail_count, first_used_at, last_used_at)
+    SELECT i.target_service, COUNT(*),
+      (SELECT COUNT(*) FROM fail_log f WHERE f.service = i.target_service),
+      MIN(i.created_at), MAX(i.created_at)
+    FROM inboxes i
+    WHERE i.target_service IS NOT NULL AND i.target_service != ''
+    GROUP BY i.target_service
+    ON CONFLICT(name) DO NOTHING;
+
+    INSERT INTO service_stats (name, fail_count, first_used_at, last_used_at)
+    SELECT f.service, COUNT(*), MIN(f.reported_at), MAX(f.reported_at)
+    FROM fail_log f
+    WHERE f.service != ''
+    GROUP BY f.service
+    ON CONFLICT(name) DO NOTHING;
+  `);
 }
 
 export function getRow<T>(database: Database.Database, sql: string, ...params: unknown[]): T | undefined {
@@ -286,6 +334,30 @@ export function setSetting(key: string, value: string): void {
     INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
   `).run(key, value);
+}
+
+export function bumpServiceCreated(name: string): void {
+  const service = typeof name === 'string' ? name.trim() : '';
+  if (!service) return;
+  getDb().prepare(`
+    INSERT INTO service_stats (name, inbox_count, first_used_at, last_used_at)
+    VALUES (?, 1, datetime('now'), datetime('now'))
+    ON CONFLICT(name) DO UPDATE SET
+      inbox_count = inbox_count + 1,
+      last_used_at = datetime('now')
+  `).run(service);
+}
+
+export function bumpServiceReported(name: string, success: boolean): void {
+  const service = typeof name === 'string' ? name.trim() : '';
+  if (!service) return;
+  // Column picked from a boolean, never from user input.
+  const column = success ? 'success_count' : 'fail_count';
+  getDb().prepare(`
+    INSERT INTO service_stats (name, ${column}, first_used_at, last_used_at)
+    VALUES (?, 1, datetime('now'), datetime('now'))
+    ON CONFLICT(name) DO UPDATE SET ${column} = ${column} + 1
+  `).run(service);
 }
 
 function backupDir(): string {

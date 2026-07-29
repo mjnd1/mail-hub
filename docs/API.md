@@ -34,7 +34,7 @@ Response 200:
 ```json
 {
   "status": "ok",
-  "version": "0.9.4",
+  "version": "0.9.9",
   "startedAt": "2025-01-01T00:00:00Z",
   "uptime": 3600,
   "db": "connected"
@@ -62,10 +62,37 @@ Create a new temporary inbox.
   "domain": "example.com",    // optional: request a specific email domain
   "subdomain": "team-a",      // optional: wildcard child domain prefix (YYDS only)
   "username": "customuser",   // optional: custom username
+  "alias": true,              // optional: ask for a sub-address (see below)
   "duration": 600,            // optional: lifespan in seconds
   "needPolling": true         // optional: require polling support (default: true)
 }
 ```
+
+**`alias`** — request a sub-address instead of the provider's plain address. The
+tag is generated server-side; callers do not supply it. Honored only by
+providers advertising `features.alias` (currently Outlook, which returns
+`account+tag@outlook.com`); silently ignored by the rest, so with auto-dispatch
+you may receive a plain address. Read `address` in the response for what you
+actually got.
+
+The inbox still occupies exactly one pooled account — an alias is a different
+address at the target service, not extra pool capacity. Use it for services that
+accept `+` in signup forms; many reject it, which is why this is opt-in per
+request rather than always on.
+
+**Effect on the anti-reuse blacklist.** Normally an Outlook account is handed to
+a given `for` service only once: reporting success records the service in the
+account's `used_services`, and later requests skip that account. An aliased
+request **bypasses that filter**, because each one mints a fresh address — so
+the same account can register at the same service repeatedly. The service is
+still recorded, so a later request *without* `alias` still finds the account
+excluded. Turning the flag off restores the original one-account-one-service
+guarantee.
+
+Two caveats worth knowing before relying on this: a site that strips `+tag`
+before comparing will still see one mailbox and may treat the second signup as a
+duplicate, and the account remains 1:1, so repeat registrations are sequential —
+close the current inbox before creating the next one on that account.
 
 **Response 201**:
 ```json
@@ -156,9 +183,19 @@ Retrieve messages in the inbox.
   ],
   "status": "active",
   "address": "user@domain.com",
-  "provider": "mailtm"
+  "provider": "mailtm",
+  "accountEmail": "user@outlook.com"
 }
 ```
+
+Pool providers hand out mailboxes that already hold a previous tenant's mail, so
+this list is clipped to the inbox's own lifetime (`created_at`, minus 60s of
+clock slack). Mail that predates the inbox is not returned even though it is
+still sitting in the upstream mailbox.
+
+`accountEmail` is present only for Outlook, where one mailbox serves one inbox at
+a time; it names the pool account so an admin client can reach
+[the mailbox view](#get-apioutlookaccountsemailmailbox--account-mailbox).
 
 **Errors**: 400 (no polling support), 404, 429 (rate limit), 502 (upstream error)
 
@@ -166,7 +203,9 @@ Retrieve messages in the inbox.
 
 ### GET /api/inbox/:id/messages/:mid — Message Detail
 
-Get full message content including body.
+Get full message content including body. The same lifetime boundary applies:
+message ids stay valid across mailbox reuse, so a message from outside this
+inbox's lifetime returns 404 rather than a previous tenant's content.
 
 **Response 200**:
 ```json
@@ -721,7 +760,7 @@ Supported formats per line:
 
 ### GET /api/outlook/accounts — List Accounts
 
-**Query parameters**: `status=valid|invalid|pending_oauth|no_token`, `available=true|false`, `group=...`, `type=long|short`
+**Query parameters**: `status=valid|invalid|pending_oauth|no_token`, `available=true|false`, `group=...`, `type=long|short`, `q=...` (fuzzy match on email or group name)
 
 **Response 200**:
 ```json
@@ -744,6 +783,78 @@ Supported formats per line:
 ```
 
 Only accounts with `client_id`, `refresh_token`, no assignment, and a non-pending/non-invalid token status are considered available for inbox allocation.
+
+### GET /api/outlook/accounts/:email/mailbox — Account Mailbox
+
+Read the whole mailbox behind a pool account, rather than one inbox's clipped
+view of it. `GET /api/inbox/:id/messages` returns only what arrived during that
+inbox's lifetime — deliberately, since a recycled account arrives holding the
+previous tenant's mail. This endpoint answers the other question: what else is in
+this mailbox. Admin only.
+
+**Query parameters**: `limit=1..100` (default 50)
+
+**Response 200**:
+```json
+{
+  "email": "user@outlook.com",
+  "limit": 50,
+  "truncated": false,
+  "messages": [
+    {
+      "id": "msg-id",
+      "from": "Steam <noreply@steampowered.com>",
+      "subject": "Your Steam code",
+      "excerpt": "",
+      "receivedAt": "2026-07-27T14:03:11Z",
+      "leaseId": "i-abc123",
+      "leaseState": "lease"
+    }
+  ],
+  "leases": [
+    {
+      "id": "i-abc123",
+      "address": "user+ab12cd34@outlook.com",
+      "targetService": "steam",
+      "createdAt": "2026-07-27 14:02:00",
+      "endedAt": null,
+      "status": "active"
+    }
+  ]
+}
+```
+
+Every message is attributed to the inbox that held the mailbox when it arrived:
+
+| `leaseState` | Meaning |
+|---|---|
+| `lease` | Arrived during `leaseId`'s window |
+| `gap` | Arrived while the account sat idle between leases |
+| `before` | Older than the account's first lease |
+| `undated` | No parseable timestamp; kept rather than dropped |
+
+A lease's window ends at whichever came first: `closed_at`, `expires_at` (only a
+fallback, for rows closed before `closed_at` was recorded), or the moment the
+next lease took the account.
+
+`limit` is a hard ceiling, not paging: the newest `limit` of Inbox and Junk are
+fetched and merged down to `limit`. Older mail exists upstream and is not
+reachable from here; `truncated` is `true` when the cap was hit.
+
+**Errors**: 403 (not admin), 404 (no such account), 502 (upstream error)
+
+---
+
+### GET /api/outlook/accounts/:email/mailbox/:messageId — Mailbox Message Detail
+
+Full content of one message from the account mailbox, not clipped to any lease.
+Admin only.
+
+**Response 200**: same shape as `GET /api/inbox/:id/messages/:mid`.
+
+**Errors**: 403 (not admin), 404 (no such account), 502 (upstream error)
+
+---
 
 ### DELETE /api/outlook/accounts — Delete Unassigned Accounts
 
@@ -919,7 +1030,7 @@ Allowed statuses: `started`, `waiting_user`, `failed`, `completed`.
 **Response 200**:
 ```json
 {
-  "recordFailService": true,
+  "recordFailService": false,
   "batchConcurrency": 5,
   "oauthClientId": "",
   "oauthRedirectUri": "http://localhost:3100/api/outlook/oauth/callback",
@@ -927,6 +1038,12 @@ Allowed statuses: `started`, `waiting_user`, `failed`, `completed`.
   "oauthTenant": "consumers"
 }
 ```
+
+`recordFailService` defaults to `false`: only a **successful** report adds the
+target service to an Outlook account's `used_services`. That list is a
+permanent, irreversible per-account blacklist — an account is never offered to
+a service it already appears against — so a transient failure must not burn a
+paid account unless the operator opts in by setting this to `true`.
 
 ### PATCH /api/outlook/settings — Update Settings
 
@@ -1065,6 +1182,13 @@ Omit to check all.
 
 All mounted under `/api/imap`.
 
+One catch-all mailbox backs many concurrent inboxes: Mail Hub invents an
+address per inbox and sorts the shared mailbox by recipient. Generated local
+parts are name-shaped rather than a random string — `nathanlambert@`,
+`lisa.chen@`, `d_watson91@`, `vera.oconnell8@` — and an address a live inbox
+already holds is never reissued. Pass `username` on `POST /api/inbox` to pick
+the local part yourself.
+
 ### GET /api/imap/stats — Pool Statistics
 
 **Response 200**:
@@ -1173,7 +1297,10 @@ On failure: `{ "ok": false, "error": "Connection refused" }`
 
 ### GET /api/services — Service Summary
 
-Aggregated view of all target services.
+Aggregated view of all target services. Counters are durable (`service_stats`
+table): they accumulate for the lifetime of the database and survive the
+retention purge of old inboxes and fail-log entries, so a service never
+disappears from this list just because its inboxes aged out.
 
 **Response 200**:
 ```json
@@ -1189,13 +1316,18 @@ Aggregated view of all target services.
       "name": "twitter.com",
       "totalInboxes": 45,
       "activeInboxes": 3,
+      "successCount": 40,
       "failCount": 2,
       "blockCount": 1,
+      "firstUsed": "2024-12-01T00:00:00Z",
       "lastUsed": "2025-01-01T00:00:00Z"
     }
   ]
 }
 ```
+
+`totalInboxes`, `successCount`, and `failCount` are cumulative; `activeInboxes`
+counts currently active (still retained) inboxes.
 
 ### GET /api/services/:name — Service Detail
 
@@ -1203,11 +1335,21 @@ Aggregated view of all target services.
 ```json
 {
   "name": "twitter.com",
+  "stats": {
+    "totalInboxes": 45,
+    "successCount": 40,
+    "failCount": 2,
+    "firstUsed": "2024-12-01T00:00:00Z",
+    "lastUsed": "2025-01-01T00:00:00Z"
+  },
   "inboxes": [...],
   "failures": [...],
   "blocks": [...]
 }
 ```
+
+`stats` is cumulative and durable; `inboxes` / `failures` list only recent,
+still-retained rows (up to 50 each).
 
 ---
 
@@ -1269,7 +1411,7 @@ Mounted under `/api/admin`.
 **Response 200**:
 ```json
 {
-  "version": "0.9.4",
+  "version": "0.9.9",
   "uptime": 3600,
   "dbPath": "/app/data/mail.db",
   "dbSize": "1.2 MB",
@@ -1277,6 +1419,23 @@ Mounted under `/api/admin`.
   "backupIntervalHours": 24
 }
 ```
+
+### GET /api/admin/update-check — Check for Updates
+
+Queries the Mail Hub GitHub repository for the highest stable `vX.Y.Z` tag and compares it with the running application version. This endpoint only checks version metadata; it does not pull Docker images, modify files, or restart the service.
+
+**Response 200**:
+```json
+{
+  "currentVersion": "0.9.9",
+  "latestVersion": "0.9.10",
+  "updateAvailable": true,
+  "checkedAt": "2026-07-17T00:00:00.000Z",
+  "source": "github-api"
+}
+```
+
+The GitHub REST query follows tag pagination. If anonymous REST access is rate-limited, the endpoint falls back to GitHub's recent tag Atom feed and returns `"source": "github-feed"`; a no-update result from that fallback is best-effort because the feed exposes a finite recent window. GitHub request failures return `502`.
 
 ---
 

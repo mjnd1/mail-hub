@@ -2,6 +2,7 @@ import { ImapFlow } from 'imapflow';
 import { BaseProvider, PROVIDER, type InboxData, type Message, type MessageDetail } from './base.js';
 import { allRows, getDb, getRow } from '../db.js';
 import { randomString } from '../utils.js';
+import { randomUsername } from '../username-generator.js';
 import { createLogger } from '../logger.js';
 import { errorMessage, logIgnoredError } from '../errors.js';
 
@@ -53,32 +54,137 @@ async function connectImap(account: ImapAccount): Promise<ImapFlow> {
   return client;
 }
 
-interface PoolEntry { client: ImapFlow; timer: ReturnType<typeof setTimeout>; }
+/**
+ * Draw a human-shaped username that no live inbox is already using.
+ *
+ * Unlike randomString(12), the human-shaped space is small enough (~7M) that
+ * a repeat is realistic, and `inboxes.address` carries no unique constraint.
+ * Two live inboxes on one address would read each other's mail, because a
+ * catch-all mailbox is sorted by the To header alone.
+ *
+ * `gen` is injectable so the collision path can be tested without relying on
+ * a lucky draw.
+ */
+export function generateUniqueUsername(domain: string, gen: () => string = randomUsername): string {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = gen();
+    const taken = getRow<{ one: number }>(
+      getDb(),
+      `SELECT 1 AS one FROM inboxes WHERE address = ? AND status = 'active' LIMIT 1`,
+      `${candidate}@${domain}`,
+    );
+    if (!taken) return candidate;
+  }
+  // Unlucky or genuinely crowded — a random suffix takes collision off the table.
+  return `${gen()}${randomString(4)}`;
+}
+
+/** The subset of imapflow's BODYSTRUCTURE tree this module needs. */
+interface BodyNode {
+  part?: string;
+  type?: string;
+  disposition?: string;
+  parameters?: { charset?: string };
+  childNodes?: BodyNode[];
+}
+
+/**
+ * Resolve which body parts actually hold the displayable text/html.
+ *
+ * Part numbers cannot be assumed: '1'/'2' only line up for a flat
+ * multipart/alternative. A single-part message has no numbered children,
+ * and under multipart/mixed the text lives at '1.1'/'1.2' while '2' is an
+ * attachment. Worse, asking for a part that does not exist fails the whole
+ * FETCH rather than just that part, so the structure must be read first.
+ */
+export function selectBodyParts(root: BodyNode | undefined): { text?: string; html?: string } {
+  if (!root) return {};
+
+  // Non-multipart message: RFC 3501 numbers the whole body as part 1.
+  if (!root.childNodes?.length) {
+    const type = root.type ?? '';
+    if (type === 'text/html') return { html: '1' };
+    if (type.startsWith('text/')) return { text: '1' };
+    return {};
+  }
+
+  let text: string | undefined;
+  let html: string | undefined;
+  const walk = (node: BodyNode): void => {
+    for (const child of node.childNodes ?? []) {
+      if (child.childNodes?.length) {
+        walk(child);
+        continue;
+      }
+      // An attachment is not the message body even when it is text/*.
+      if (child.disposition === 'attachment') continue;
+      if (!text && child.type === 'text/plain') text = child.part;
+      if (!html && child.type === 'text/html') html = child.part;
+    }
+  };
+  walk(root);
+  return { text, html };
+}
+
+/** Decode a body buffer using the part's declared charset, not a blind utf8 cast. */
+export function decodeBody(buf: Buffer, charset?: string): string {
+  if (!buf.length) return '';
+  const label = (charset || 'utf-8').trim();
+  try {
+    return new TextDecoder(label).decode(buf);
+  } catch {
+    // Unknown/unsupported label — utf8 is the least-bad fallback.
+    return buf.toString('utf8');
+  }
+}
+
+interface PoolEntry { clientPromise: Promise<ImapFlow>; timer: ReturnType<typeof setTimeout>; }
 const pool = new Map<string, PoolEntry>();
 const IDLE_MS = 5 * 60 * 1000;
+// A busy catch-all mailbox can match hundreds of UIDs; poll only the newest.
+const POLL_FETCH_LIMIT = 20;
 
-function evictClient(id: string): void {
-  const entry = pool.get(id);
-  if (!entry) return;
-  clearTimeout(entry.timer);
+function evictClient(id: string, entry?: PoolEntry): void {
+  const current = pool.get(id);
+  if (!current) return;
+  // Entry-matched eviction: an async error callback must not kill a newer
+  // client that has since replaced the failed one.
+  if (entry && current !== entry) return;
+  clearTimeout(current.timer);
   pool.delete(id);
-  entry.client.logout().catch((error: unknown) => {
-    logIgnoredError(log, 'IMAP pooled client logout failed', error, { accountId: id });
-  });
+  current.clientPromise
+    .then((client) => client.logout())
+    .catch((error: unknown) => {
+      logIgnoredError(log, 'IMAP pooled client logout failed', error, { accountId: id });
+    });
 }
 
 async function getPooledClient(account: ImapAccount): Promise<ImapFlow> {
   const existing = pool.get(account.id);
   if (existing) {
     clearTimeout(existing.timer);
-    existing.timer = setTimeout(() => evictClient(account.id), IDLE_MS);
-    return existing.client;
+    existing.timer = setTimeout(() => evictClient(account.id, existing), IDLE_MS);
+    return existing.clientPromise;
   }
-  const client = await connectImap(account);
-  client.once('error', () => evictClient(account.id));
-  const timer = setTimeout(() => evictClient(account.id), IDLE_MS);
-  pool.set(account.id, { client, timer });
-  return client;
+  // The entry is registered synchronously (holding a promise) so concurrent
+  // callers share one connection instead of racing to open duplicates.
+  const entry: PoolEntry = {
+    clientPromise: connectImap(account).then((client) => {
+      client.once('error', () => evictClient(account.id, entry));
+      return client;
+    }),
+    timer: setTimeout(() => evictClient(account.id, entry), IDLE_MS),
+  };
+  pool.set(account.id, entry);
+  try {
+    return await entry.clientPromise;
+  } catch (e) {
+    if (pool.get(account.id) === entry) {
+      clearTimeout(entry.timer);
+      pool.delete(account.id);
+    }
+    throw e;
+  }
 }
 
 export class ImapProvider extends BaseProvider {
@@ -116,7 +222,7 @@ export class ImapProvider extends BaseProvider {
       account = accounts[Math.floor(Math.random() * accounts.length)];
     }
 
-    const username = opts?.username || randomString(12);
+    const username = opts?.username || generateUniqueUsername(account.domain);
 
     return {
       address: `${username}@${account.domain}`,
@@ -141,15 +247,11 @@ export class ImapProvider extends BaseProvider {
         const toAddr = inbox.address;
         const uids = await client.search({ to: toAddr }, { uid: true });
         if (!uids || uids.length === 0) return [];
+        const recent = uids.slice(-POLL_FETCH_LIMIT);
         const messages: Message[] = [];
-        for (const uid of uids) {
-          const fetched = await client.fetchOne(String(uid), {
-            envelope: true,
-            bodyStructure: true,
-          }, { uid: true });
-          if (!fetched) continue;
+        for await (const fetched of client.fetch(recent, { envelope: true }, { uid: true })) {
           messages.push({
-            id: String(uid),
+            id: String(fetched.uid),
             from: fetched.envelope?.from?.[0]?.address ?? '',
             subject: fetched.envelope?.subject ?? '',
             excerpt: '',
@@ -177,18 +279,34 @@ export class ImapProvider extends BaseProvider {
         const fetched = await client.fetchOne(messageId, {
           uid: true,
           envelope: true,
-          bodyParts: ['1', '2'],
+          bodyStructure: true,
         }, { uid: true });
 
         if (!fetched) throw new Error(`Message ${messageId} not found`);
 
+        const parts = selectBodyParts(fetched.bodyStructure as BodyNode | undefined);
+
+        // download() applies the Content-Transfer-Encoding decoder, so
+        // quoted-printable soft breaks cannot split a verification code the
+        // way a raw toString() left them.
+        const readPart = async (part: string): Promise<string> => {
+          const { meta, content } = await client.download(messageId, part, { uid: true });
+          const chunks: Buffer[] = [];
+          for await (const chunk of content) chunks.push(chunk as Buffer);
+          return decodeBody(Buffer.concat(chunks), meta?.charset);
+        };
+
         let text = '';
         let html = '';
-        try { text = fetched.bodyParts?.get('1')?.toString() ?? ''; } catch (error) {
-          log.warn('failed to read IMAP text body part', { accountId: account.id, messageId, error: errorMessage(error) });
+        if (parts.text) {
+          try { text = await readPart(parts.text); } catch (error) {
+            log.warn('failed to read IMAP text body part', { accountId: account.id, messageId, part: parts.text, error: errorMessage(error) });
+          }
         }
-        try { html = fetched.bodyParts?.get('2')?.toString() ?? ''; } catch (error) {
-          log.warn('failed to read IMAP html body part', { accountId: account.id, messageId, error: errorMessage(error) });
+        if (parts.html) {
+          try { html = await readPart(parts.html); } catch (error) {
+            log.warn('failed to read IMAP html body part', { accountId: account.id, messageId, part: parts.html, error: errorMessage(error) });
+          }
         }
 
         return {
